@@ -1,0 +1,20 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: simpterm
+          path: simpterm
