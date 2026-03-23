@@ -23,10 +23,13 @@
 #include <unistd.h>
 
 #include <pty.h>
+#include <time.h>
 
 #define NAME_MAX_LEN 64
 #define MSG_MAX_LEN 256
+#define CMD_MAX_LEN 4096
 #define PAYLOAD_MAX 4096
+#define MARKER_LEN 32
 #define BACKLOG_LIMIT (1024 * 1024)
 #define MAX_SESSIONS 128
 
@@ -34,7 +37,8 @@ enum ctl_cmd {
     CMD_NEW = 1,
     CMD_LIST = 2,
     CMD_KILL = 3,
-    CMD_ATTACH = 4
+    CMD_ATTACH = 4,
+    CMD_EXEC = 5
 };
 
 enum pkt_type {
@@ -48,6 +52,7 @@ struct ctl_req {
     int id;
     struct winsize ws;
     char name[NAME_MAX_LEN];
+    char data[CMD_MAX_LEN];
 };
 
 struct ctl_resp {
@@ -57,6 +62,7 @@ struct ctl_resp {
     int more;
     char name[NAME_MAX_LEN];
     char msg[MSG_MAX_LEN];
+    char marker[MARKER_LEN];
 };
 
 struct packet {
@@ -71,6 +77,7 @@ struct session {
     pid_t pid;
     int pty_fd;
     int client_fd;
+    int exec_fd;
     char name[NAME_MAX_LEN];
     char *backlog;
     size_t backlog_len;
@@ -377,6 +384,9 @@ static void session_cleanup(struct session *s) {
         return;
     }
     session_detach_client(s);
+    if (s->exec_fd >= 0) {
+        close(s->exec_fd);
+    }
     if (s->pty_fd >= 0) {
         close(s->pty_fd);
     }
@@ -384,6 +394,7 @@ static void session_cleanup(struct session *s) {
     memset(s, 0, sizeof(*s));
     s->pty_fd = -1;
     s->client_fd = -1;
+    s->exec_fd = -1;
 }
 
 static struct session *session_create(const char *requested_name, struct winsize ws, char *err, size_t err_size) {
@@ -426,6 +437,7 @@ static struct session *session_create(const char *requested_name, struct winsize
     s->pid = pid;
     s->pty_fd = pty_fd;
     s->client_fd = -1;
+    s->exec_fd = -1;
     if (requested_name && requested_name[0]) {
         snprintf(s->name, sizeof(s->name), "%s", requested_name);
     } else {
@@ -445,6 +457,9 @@ static void reap_children(void) {
             if (sessions[i].used && sessions[i].pid == pid) {
                 if (sessions[i].client_fd >= 0) {
                     send_packet(sessions[i].client_fd, PKT_EXIT, NULL, 0);
+                }
+                if (sessions[i].exec_fd >= 0) {
+                    send_packet(sessions[i].exec_fd, PKT_EXIT, NULL, 0);
                 }
                 session_cleanup(&sessions[i]);
                 break;
@@ -664,6 +679,65 @@ static void handle_attach(int client_fd, struct ctl_req *req) {
     flush_backlog_to_client(s);
 }
 
+static void generate_marker(char *buf, size_t size) {
+    unsigned long r = 0;
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0) {
+        if (read(fd, &r, sizeof(r)) < 0) { r = (unsigned long)getpid(); }
+        close(fd);
+    }
+    snprintf(buf, size, "__SIMPTERM_DONE_%lx__", r);
+}
+
+static void handle_exec(int client_fd, struct ctl_req *req) {
+    struct ctl_resp resp;
+    struct session *s = find_session(req->name, req->id);
+    char marker[MARKER_LEN];
+    char wrapped[CMD_MAX_LEN + MARKER_LEN + 32];
+
+    memset(&resp, 0, sizeof(resp));
+    if (!s) {
+        resp.status = -1;
+        snprintf(resp.msg, sizeof(resp.msg), "session not found");
+        send_ctl_resp(client_fd, &resp);
+        close(client_fd);
+        return;
+    }
+    if (s->exec_fd >= 0) {
+        resp.status = -1;
+        snprintf(resp.msg, sizeof(resp.msg), "session has pending exec");
+        send_ctl_resp(client_fd, &resp);
+        close(client_fd);
+        return;
+    }
+    if (!req->data[0]) {
+        resp.status = -1;
+        snprintf(resp.msg, sizeof(resp.msg), "empty command");
+        send_ctl_resp(client_fd, &resp);
+        close(client_fd);
+        return;
+    }
+
+    generate_marker(marker, sizeof(marker));
+    snprintf(wrapped, sizeof(wrapped), "%s\necho %s\n", req->data, marker);
+
+    set_nonblocking(client_fd);
+    s->exec_fd = client_fd;
+
+    resp.status = 0;
+    resp.id = s->id;
+    resp.pid = s->pid;
+    snprintf(resp.name, sizeof(resp.name), "%s", s->name);
+    snprintf(resp.marker, sizeof(resp.marker), "%s", marker);
+    if (send_ctl_resp(client_fd, &resp) < 0) {
+        s->exec_fd = -1;
+        close(client_fd);
+        return;
+    }
+
+    write_all_fd(s->pty_fd, wrapped, strlen(wrapped));
+}
+
 static void daemon_handle_client(int client_fd) {
     struct ctl_req req;
 
@@ -685,6 +759,9 @@ static void daemon_handle_client(int client_fd) {
     case CMD_ATTACH:
         handle_attach(client_fd, &req);
         break;
+    case CMD_EXEC:
+        handle_exec(client_fd, &req);
+        break;
     default:
         close(client_fd);
         break;
@@ -693,9 +770,10 @@ static void daemon_handle_client(int client_fd) {
 
 static void daemon_event_loop(int listen_fd) {
     for (;;) {
-        struct pollfd pfds[1 + MAX_SESSIONS * 2];
-        int pty_slot[1 + MAX_SESSIONS * 2];
-        int client_slot[1 + MAX_SESSIONS * 2];
+        struct pollfd pfds[1 + MAX_SESSIONS * 3];
+        int pty_slot[1 + MAX_SESSIONS * 3];
+        int client_slot[1 + MAX_SESSIONS * 3];
+        int exec_slot[1 + MAX_SESSIONS * 3];
         int nfds = 0;
         int i;
 
@@ -705,6 +783,7 @@ static void daemon_event_loop(int listen_fd) {
         pfds[nfds].events = POLLIN;
         pty_slot[nfds] = -1;
         client_slot[nfds] = -1;
+        exec_slot[nfds] = -1;
         nfds++;
 
         for (i = 0; i < MAX_SESSIONS; i++) {
@@ -715,21 +794,42 @@ static void daemon_event_loop(int listen_fd) {
             pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
             pty_slot[nfds] = i;
             client_slot[nfds] = -1;
+            exec_slot[nfds] = -1;
             nfds++;
             if (sessions[i].client_fd >= 0) {
                 pfds[nfds].fd = sessions[i].client_fd;
                 pfds[nfds].events = POLLIN | POLLHUP | POLLERR;
                 pty_slot[nfds] = -1;
                 client_slot[nfds] = i;
+                exec_slot[nfds] = -1;
+                nfds++;
+            }
+            if (sessions[i].exec_fd >= 0) {
+                pfds[nfds].fd = sessions[i].exec_fd;
+                pfds[nfds].events = POLLHUP | POLLERR;
+                pty_slot[nfds] = -1;
+                client_slot[nfds] = -1;
+                exec_slot[nfds] = i;
                 nfds++;
             }
         }
 
-        if (poll(pfds, nfds, -1) < 0) {
-            if (errno == EINTR) {
-                continue;
+        {
+            int has_sessions = 0;
+            int rc;
+            for (i = 0; i < MAX_SESSIONS; i++) {
+                if (sessions[i].used) { has_sessions = 1; break; }
             }
-            break;
+            rc = poll(pfds, nfds, has_sessions ? -1 : 10000);
+            if (rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (rc == 0 && !has_sessions) {
+                break;
+            }
         }
 
         for (i = 0; i < nfds; i++) {
@@ -755,6 +855,9 @@ static void daemon_event_loop(int listen_fd) {
                     if (s->client_fd >= 0) {
                         send_packet(s->client_fd, PKT_EXIT, NULL, 0);
                     }
+                    if (s->exec_fd >= 0) {
+                        send_packet(s->exec_fd, PKT_EXIT, NULL, 0);
+                    }
                     session_cleanup(s);
                     continue;
                 }
@@ -769,12 +872,19 @@ static void daemon_event_loop(int listen_fd) {
                     if (s->client_fd >= 0) {
                         send_packet(s->client_fd, PKT_EXIT, NULL, 0);
                     }
+                    if (s->exec_fd >= 0) {
+                        send_packet(s->exec_fd, PKT_EXIT, NULL, 0);
+                    }
                     session_cleanup(s);
                     continue;
                 }
                 session_append_backlog(s, buf, (size_t)n);
                 if (s->client_fd >= 0 && send_packet(s->client_fd, PKT_DATA, buf, (uint32_t)n) < 0) {
                     session_detach_client(s);
+                }
+                if (s->exec_fd >= 0 && send_packet(s->exec_fd, PKT_DATA, buf, (uint32_t)n) < 0) {
+                    close(s->exec_fd);
+                    s->exec_fd = -1;
                 }
                 continue;
             }
@@ -806,6 +916,18 @@ static void daemon_event_loop(int listen_fd) {
                     memcpy(&ws, pkt.data, sizeof(ws));
                     ioctl(s->pty_fd, TIOCSWINSZ, &ws);
                 }
+                continue;
+            }
+
+            if (exec_slot[i] >= 0) {
+                s = find_session_by_slot(exec_slot[i]);
+                if (!s) {
+                    continue;
+                }
+                if (pfds[i].revents & (POLLHUP | POLLERR)) {
+                    close(s->exec_fd);
+                    s->exec_fd = -1;
+                }
             }
         }
     }
@@ -829,6 +951,11 @@ static void daemon_main(void) {
     }
     daemon_event_loop(listen_fd);
     close(listen_fd);
+    {
+        char path[108];
+        format_socket_path(path, sizeof(path));
+        unlink(path);
+    }
     _exit(0);
 }
 
@@ -974,6 +1101,134 @@ static int cmd_kill(const char *target) {
     return 0;
 }
 
+static int cmd_exec(const char *target, int timeout_sec, const char *command) {
+    int fd;
+    struct ctl_req req;
+    struct ctl_resp resp;
+    char marker[MARKER_LEN];
+    char scan_buf[PAYLOAD_MAX * 2];
+    size_t scan_len = 0;
+    time_t deadline;
+
+    ensure_daemon_running();
+    fd = connect_daemon();
+    if (fd < 0) {
+        die("connect daemon failed: %s", strerror(errno));
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.cmd = CMD_EXEC;
+    if (is_numeric(target)) {
+        req.id = atoi(target);
+    } else {
+        strncpy(req.name, target, sizeof(req.name) - 1);
+    }
+    strncpy(req.data, command, sizeof(req.data) - 1);
+
+    if (send_ctl_req(fd, &req) < 0 || recv_ctl_resp(fd, &resp) < 0) {
+        die("exec request failed");
+    }
+    if (resp.status < 0) {
+        close(fd);
+        die("%s", resp.msg[0] ? resp.msg : "exec failed");
+    }
+
+    strncpy(marker, resp.marker, sizeof(marker) - 1);
+    marker[sizeof(marker) - 1] = '\0';
+    deadline = time(NULL) + timeout_sec;
+
+    for (;;) {
+        struct pollfd pfd;
+        int remaining = (int)(deadline - time(NULL));
+        struct packet pkt;
+        int rc;
+
+        if (remaining <= 0) {
+            fprintf(stderr, "\nsimpterm: exec timed out\n");
+            close(fd);
+            return 1;
+        }
+
+        pfd.fd = fd;
+        pfd.events = POLLIN | POLLHUP | POLLERR;
+
+        rc = poll(&pfd, 1, remaining * 1000);
+        if (rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (rc == 0) {
+            fprintf(stderr, "\nsimpterm: exec timed out\n");
+            close(fd);
+            return 1;
+        }
+
+        if (pfd.revents & (POLLHUP | POLLERR)) {
+            break;
+        }
+
+        rc = recv_packet(fd, &pkt);
+        if (rc <= 0 || pkt.type == PKT_EXIT) {
+            break;
+        }
+
+        if (pkt.type == PKT_DATA && pkt.len > 0) {
+            /* Check if marker appears in this chunk or spanning prev+this */
+            size_t marker_len = strlen(marker);
+            size_t keep = marker_len > 1 ? marker_len - 1 : 0;
+            size_t total;
+            char *found;
+
+            /* Append to scan buffer */
+            if (scan_len + pkt.len > sizeof(scan_buf)) {
+                /* Flush old data that can't contain marker start */
+                size_t flush = scan_len + pkt.len - sizeof(scan_buf);
+                if (flush > scan_len) {
+                    flush = scan_len;
+                }
+                write_all_fd(STDOUT_FILENO, scan_buf, flush);
+                memmove(scan_buf, scan_buf + flush, scan_len - flush);
+                scan_len -= flush;
+            }
+            memcpy(scan_buf + scan_len, pkt.data, pkt.len);
+            scan_len += pkt.len;
+
+            found = memmem(scan_buf, scan_len, marker, marker_len);
+            if (found) {
+                /* Output everything before the marker line */
+                /* Walk back to find the start of the marker line */
+                char *line_start = found;
+                while (line_start > scan_buf && *(line_start - 1) != '\n') {
+                    line_start--;
+                }
+                if (line_start > scan_buf) {
+                    write_all_fd(STDOUT_FILENO, scan_buf, (size_t)(line_start - scan_buf));
+                }
+                close(fd);
+                return 0;
+            }
+
+            /* Flush data that can't be part of marker */
+            total = scan_len;
+            if (total > keep) {
+                size_t flush = total - keep;
+                write_all_fd(STDOUT_FILENO, scan_buf, flush);
+                memmove(scan_buf, scan_buf + flush, keep);
+                scan_len = keep;
+            }
+        }
+    }
+
+    /* Flush remaining scan buffer */
+    if (scan_len > 0) {
+        write_all_fd(STDOUT_FILENO, scan_buf, scan_len);
+    }
+    close(fd);
+    return 0;
+}
+
 static void send_resize_if_needed(int fd, int force) {
     struct winsize ws;
 
@@ -1081,10 +1336,11 @@ static int cmd_attach(const char *target) {
 static void usage(FILE *out) {
     fprintf(out,
             "usage:\n"
-            "  simpterm n [name]    new session\n"
-            "  simpterm a <name|id> attach\n"
-            "  simpterm l           list sessions\n"
-            "  simpterm k <name|id> kill session\n");
+            "  simpterm n [name]                  new session\n"
+            "  simpterm a <name|id>               attach\n"
+            "  simpterm e <name|id> <timeout> <cmd> exec command\n"
+            "  simpterm l                         list sessions\n"
+            "  simpterm k <name|id>               kill session\n");
 }
 
 int main(int argc, char **argv) {
@@ -1112,6 +1368,15 @@ int main(int argc, char **argv) {
             return 1;
         }
         return cmd_attach(argv[2]);
+    case 'e':
+        if (argc < 5) {
+            usage(stderr);
+            return 1;
+        }
+        if (!is_numeric(argv[3])) {
+            die("timeout must be a number (seconds)");
+        }
+        return cmd_exec(argv[2], atoi(argv[3]), argv[4]);
     case 'l':
         return cmd_list();
     case 'k':
