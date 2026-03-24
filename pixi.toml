@@ -2,10 +2,11 @@
 authors = ["yijiexia <yijiexia@pku.edu.cn>"]
 channels = ["conda-forge"]
 name = "simpterm"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-64", "osx-arm64", "win-64"]
 version = "0.1.0"
 
 [tasks]
+compile = "go build -o simpterm ."
 
 [dependencies]
 go = ">=1.26.1,<2"
