@@ -1,0 +1,992 @@
+package main
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+	"unicode"
+
+	ptylib "github.com/creack/pty"
+	"golang.org/x/term"
+)
+
+// --- Protocol ---
+
+const (
+	frameData   byte = 1
+	frameResize byte = 2
+	frameExit   byte = 3
+)
+
+const (
+	backlogLimit = 1024 * 1024
+	maxPayload   = 4096
+	idleTimeout  = 10 * time.Second
+)
+
+type Request struct {
+	Cmd     string `json:"cmd"`
+	Name    string `json:"name,omitempty"`
+	ID      int    `json:"id,omitempty"`
+	Rows    uint16 `json:"rows,omitempty"`
+	Cols    uint16 `json:"cols,omitempty"`
+	Command string `json:"command,omitempty"`
+}
+
+type Response struct {
+	Status int    `json:"status"`
+	ID     int    `json:"id,omitempty"`
+	Name   string `json:"name,omitempty"`
+	PID    int    `json:"pid,omitempty"`
+	Msg    string `json:"msg,omitempty"`
+	Marker string `json:"marker,omitempty"`
+}
+
+type SessionInfo struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+	PID  int    `json:"pid"`
+}
+
+type ListResponse struct {
+	Status   int           `json:"status"`
+	Sessions []SessionInfo `json:"sessions"`
+}
+
+// Wire helpers: 4-byte big-endian length + JSON payload
+
+func sendJSON(conn net.Conn, v any) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+	if _, err := conn.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err = conn.Write(data)
+	return err
+}
+
+func recvJSON(conn net.Conn, v any) error {
+	var hdr [4]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > 1<<20 {
+		return fmt.Errorf("message too large: %d", n)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return err
+	}
+	return json.Unmarshal(buf, v)
+}
+
+// Frame helpers: 1-byte type + 4-byte length + payload
+
+func sendFrame(conn net.Conn, typ byte, data []byte) error {
+	var hdr [5]byte
+	hdr[0] = typ
+	binary.BigEndian.PutUint32(hdr[1:], uint32(len(data)))
+	if _, err := conn.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(data) > 0 {
+		_, err := conn.Write(data)
+		return err
+	}
+	return nil
+}
+
+func recvFrame(conn net.Conn) (byte, []byte, error) {
+	var hdr [5]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	typ := hdr[0]
+	n := binary.BigEndian.Uint32(hdr[1:])
+	if n > maxPayload {
+		return 0, nil, fmt.Errorf("frame too large: %d", n)
+	}
+	if n == 0 {
+		return typ, nil, nil
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return 0, nil, err
+	}
+	return typ, buf, nil
+}
+
+// --- Session ---
+
+type Session struct {
+	ID      int
+	Name    string
+	PtyFile *os.File
+	Cmd     *exec.Cmd
+
+	mu       sync.Mutex
+	client   net.Conn
+	execConn net.Conn
+
+	backlogMu sync.Mutex
+	backlog   []byte
+
+	done chan struct{}
+}
+
+func (s *Session) appendBacklog(data []byte) {
+	s.backlogMu.Lock()
+	defer s.backlogMu.Unlock()
+	s.backlog = append(s.backlog, data...)
+	if len(s.backlog) > backlogLimit {
+		s.backlog = s.backlog[len(s.backlog)-backlogLimit:]
+	}
+}
+
+func (s *Session) setClient(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.client = conn
+}
+
+func (s *Session) getClient() net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client
+}
+
+func (s *Session) detachClient() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client != nil {
+		s.client.Close()
+		s.client = nil
+	}
+}
+
+func (s *Session) setExec(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.execConn = conn
+}
+
+func (s *Session) getExec() net.Conn {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.execConn
+}
+
+func (s *Session) detachExec() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.execConn != nil {
+		s.execConn.Close()
+		s.execConn = nil
+	}
+}
+
+// ptyReader runs in a goroutine, reads PTY output and forwards to clients.
+func (s *Session) ptyReader() {
+	defer close(s.done)
+	buf := make([]byte, maxPayload)
+	for {
+		n, err := s.PtyFile.Read(buf)
+		if n > 0 {
+			data := buf[:n]
+			s.appendBacklog(data)
+			if c := s.getClient(); c != nil {
+				if sendFrame(c, frameData, data) != nil {
+					s.detachClient()
+				}
+			}
+			if c := s.getExec(); c != nil {
+				if sendFrame(c, frameData, data) != nil {
+					s.detachExec()
+				}
+			}
+		}
+		if err != nil {
+			// Notify connected clients
+			if c := s.getClient(); c != nil {
+				sendFrame(c, frameExit, nil)
+			}
+			if c := s.getExec(); c != nil {
+				sendFrame(c, frameExit, nil)
+			}
+			return
+		}
+	}
+}
+
+// --- Daemon ---
+
+type Daemon struct {
+	mu       sync.Mutex
+	sessions map[int]*Session
+	nextID   int
+	listener net.Listener
+}
+
+func newDaemon(listener net.Listener) *Daemon {
+	return &Daemon{
+		sessions: make(map[int]*Session),
+		nextID:   1,
+		listener: listener,
+	}
+}
+
+func (d *Daemon) findSession(name string, id int) *Session {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if id > 0 {
+		if s, ok := d.sessions[id]; ok {
+			return s
+		}
+	}
+	if name != "" {
+		for _, s := range d.sessions {
+			if s.Name == name {
+				return s
+			}
+		}
+	}
+	return nil
+}
+
+func (d *Daemon) removeSession(id int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.sessions, id)
+}
+
+func (d *Daemon) sessionCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.sessions)
+}
+
+func (d *Daemon) handleNew(conn net.Conn, req Request) {
+	name := req.Name
+	if name != "" && isNumeric(name) {
+		sendJSON(conn, Response{Status: -1, Msg: "session name cannot be purely numeric"})
+		return
+	}
+	if name != "" && d.findSession(name, 0) != nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session name already exists"})
+		return
+	}
+
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	cmd := exec.Command(shell)
+	cmd.Env = os.Environ()
+
+	rows, cols := uint16(24), uint16(80)
+	if req.Rows > 0 {
+		rows = req.Rows
+	}
+	if req.Cols > 0 {
+		cols = req.Cols
+	}
+
+	ptmx, err := ptylib.StartWithSize(cmd, &ptylib.Winsize{
+		Rows: rows, Cols: cols,
+	})
+	if err != nil {
+		sendJSON(conn, Response{Status: -1, Msg: fmt.Sprintf("forkpty failed: %v", err)})
+		return
+	}
+
+	d.mu.Lock()
+	id := d.nextID
+	d.nextID++
+	if name == "" {
+		name = fmt.Sprintf("s%d", id)
+	}
+	s := &Session{
+		ID:      id,
+		Name:    name,
+		PtyFile: ptmx,
+		Cmd:     cmd,
+		done:    make(chan struct{}),
+	}
+	d.sessions[id] = s
+	d.mu.Unlock()
+
+	go s.ptyReader()
+	go func() {
+		s.Cmd.Wait()
+		s.PtyFile.Close()
+		// Wait for ptyReader to finish
+		<-s.done
+		s.detachClient()
+		s.detachExec()
+		d.removeSession(s.ID)
+	}()
+
+	pid := 0
+	if cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+	sendJSON(conn, Response{Status: 0, ID: id, Name: name, PID: pid})
+}
+
+func (d *Daemon) handleList(conn net.Conn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var infos []SessionInfo
+	for _, s := range d.sessions {
+		pid := 0
+		if s.Cmd.Process != nil {
+			pid = s.Cmd.Process.Pid
+		}
+		infos = append(infos, SessionInfo{ID: s.ID, Name: s.Name, PID: pid})
+	}
+	sendJSON(conn, ListResponse{Status: 0, Sessions: infos})
+}
+
+func (d *Daemon) handleKill(conn net.Conn, req Request) {
+	s := d.findSession(req.Name, req.ID)
+	if s == nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session not found"})
+		return
+	}
+	if s.Cmd.Process != nil {
+		// Kill process group
+		syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGHUP)
+		syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGTERM)
+		// Wait briefly, then SIGKILL if needed
+		timer := time.After(500 * time.Millisecond)
+		select {
+		case <-s.done:
+		case <-timer:
+			syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGKILL)
+		}
+	}
+	sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name})
+}
+
+func (d *Daemon) handleAttach(conn net.Conn, req Request) {
+	s := d.findSession(req.Name, req.ID)
+	if s == nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session not found"})
+		return
+	}
+	if s.getClient() != nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session already attached"})
+		return
+	}
+
+	// Resize PTY
+	if req.Rows > 0 && req.Cols > 0 {
+		ptylib.Setsize(s.PtyFile, &ptylib.Winsize{Rows: req.Rows, Cols: req.Cols})
+	}
+
+	pid := 0
+	if s.Cmd.Process != nil {
+		pid = s.Cmd.Process.Pid
+	}
+	if err := sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name, PID: pid}); err != nil {
+		return
+	}
+
+	s.setClient(conn)
+
+	// Flush backlog
+	s.backlogMu.Lock()
+	bl := make([]byte, len(s.backlog))
+	copy(bl, s.backlog)
+	s.backlogMu.Unlock()
+
+	for off := 0; off < len(bl); {
+		end := off + maxPayload
+		if end > len(bl) {
+			end = len(bl)
+		}
+		if sendFrame(conn, frameData, bl[off:end]) != nil {
+			s.detachClient()
+			return
+		}
+		off = end
+	}
+
+	// Read client input in this goroutine (connection handler)
+	go func() {
+		defer s.detachClient()
+		for {
+			typ, data, err := recvFrame(conn)
+			if err != nil {
+				return
+			}
+			switch typ {
+			case frameData:
+				s.PtyFile.Write(data)
+			case frameResize:
+				if len(data) == 4 {
+					rows := binary.BigEndian.Uint16(data[0:2])
+					cols := binary.BigEndian.Uint16(data[2:4])
+					ptylib.Setsize(s.PtyFile, &ptylib.Winsize{Rows: rows, Cols: cols})
+				}
+			}
+		}
+	}()
+}
+
+func generateMarker() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return fmt.Sprintf("__SIMPTERM_DONE_%x__", b)
+}
+
+func (d *Daemon) handleExec(conn net.Conn, req Request) {
+	s := d.findSession(req.Name, req.ID)
+	if s == nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session not found"})
+		return
+	}
+	if s.getExec() != nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session has pending exec"})
+		return
+	}
+	if req.Command == "" {
+		sendJSON(conn, Response{Status: -1, Msg: "empty command"})
+		return
+	}
+
+	marker := generateMarker()
+	wrapped := fmt.Sprintf(" %s\n echo '%s'\n", req.Command, marker)
+
+	pid := 0
+	if s.Cmd.Process != nil {
+		pid = s.Cmd.Process.Pid
+	}
+	if err := sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name, PID: pid, Marker: marker}); err != nil {
+		return
+	}
+
+	// Set exec AFTER response is sent to avoid race with ptyReader
+	s.setExec(conn)
+	s.PtyFile.Write([]byte(wrapped))
+
+	// Monitor exec connection for disconnect
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			_, err := conn.Read(buf)
+			if err != nil {
+				s.detachExec()
+				return
+			}
+		}
+	}()
+}
+
+func (d *Daemon) handleConn(conn net.Conn) {
+	var req Request
+	if err := recvJSON(conn, &req); err != nil {
+		conn.Close()
+		return
+	}
+
+	switch req.Cmd {
+	case "new":
+		d.handleNew(conn, req)
+		conn.Close()
+	case "list":
+		d.handleList(conn)
+		conn.Close()
+	case "kill":
+		d.handleKill(conn, req)
+		conn.Close()
+	case "attach":
+		d.handleAttach(conn, req)
+		// conn stays open, managed by session
+	case "exec":
+		d.handleExec(conn, req)
+		// conn stays open, managed by session
+	default:
+		conn.Close()
+	}
+}
+
+func (d *Daemon) run() {
+	for {
+		if d.sessionCount() == 0 {
+			d.listener.(*net.UnixListener).SetDeadline(time.Now().Add(idleTimeout))
+		} else {
+			d.listener.(*net.UnixListener).SetDeadline(time.Time{})
+		}
+
+		conn, err := d.listener.Accept()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				if d.sessionCount() == 0 {
+					return // idle exit
+				}
+				continue
+			}
+			return
+		}
+		go d.handleConn(conn)
+	}
+}
+
+// --- Paths ---
+
+func runtimeDir() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("simpterm-%d", os.Getuid()))
+}
+
+func socketPath() string {
+	return filepath.Join(runtimeDir(), "daemon.sock")
+}
+
+func ensureRuntimeDir() {
+	dir := runtimeDir()
+	os.MkdirAll(dir, 0700)
+	os.Chmod(dir, 0700)
+}
+
+// --- Daemon lifecycle ---
+
+func connectDaemon() (net.Conn, error) {
+	return net.DialTimeout("unix", socketPath(), 2*time.Second)
+}
+
+func spawnDaemon() {
+	exe, err := os.Executable()
+	if err != nil {
+		die("cannot find executable: %v", err)
+	}
+	cmd := exec.Command(exe, "__daemon")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		die("spawn daemon failed: %v", err)
+	}
+	cmd.Process.Release()
+}
+
+func ensureDaemon() {
+	conn, err := connectDaemon()
+	if err == nil {
+		conn.Close()
+		return
+	}
+	spawnDaemon()
+	for i := 0; i < 50; i++ {
+		time.Sleep(100 * time.Millisecond)
+		conn, err = connectDaemon()
+		if err == nil {
+			conn.Close()
+			return
+		}
+	}
+	die("failed to start daemon")
+}
+
+func daemonMain() {
+	ensureRuntimeDir()
+	path := socketPath()
+	os.Remove(path)
+
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		os.Exit(1)
+	}
+	defer listener.Close()
+	defer os.Remove(path)
+
+	// Detach stdio
+	os.Stdin.Close()
+	os.Stdout.Close()
+	os.Stderr.Close()
+
+	d := newDaemon(listener)
+	d.run()
+}
+
+// --- Client commands ---
+
+func getWinsize() (uint16, uint16) {
+	w, h, err := term.GetSize(int(os.Stdin.Fd()))
+	if err != nil {
+		return 80, 24
+	}
+	return uint16(h), uint16(w)
+}
+
+func cmdNew(name string) {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+	defer conn.Close()
+
+	rows, cols := getWinsize()
+	req := Request{Cmd: "new", Name: name, Rows: rows, Cols: cols}
+	if err := sendJSON(conn, req); err != nil {
+		die("send failed: %v", err)
+	}
+	var resp Response
+	if err := recvJSON(conn, &resp); err != nil {
+		die("daemon request failed")
+	}
+	if resp.Status < 0 {
+		die("%s", resp.Msg)
+	}
+	fmt.Printf("%s\t%d\n", resp.Name, resp.ID)
+}
+
+func cmdList() {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+	defer conn.Close()
+
+	if err := sendJSON(conn, Request{Cmd: "list"}); err != nil {
+		die("send failed: %v", err)
+	}
+	var resp ListResponse
+	if err := recvJSON(conn, &resp); err != nil {
+		die("daemon request failed")
+	}
+	fmt.Println("ID\tNAME\tPID")
+	for _, s := range resp.Sessions {
+		fmt.Printf("%d\t%s\t%d\n", s.ID, s.Name, s.PID)
+	}
+}
+
+func cmdKill(target string) {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := Request{Cmd: "kill"}
+	if isNumeric(target) {
+		req.ID, _ = strconv.Atoi(target)
+	} else {
+		req.Name = target
+	}
+	if err := sendJSON(conn, req); err != nil {
+		die("send failed: %v", err)
+	}
+	var resp Response
+	if err := recvJSON(conn, &resp); err != nil {
+		die("daemon request failed")
+	}
+	if resp.Status < 0 {
+		die("%s", resp.Msg)
+	}
+}
+
+func cmdAttach(target string) {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+
+	rows, cols := getWinsize()
+	req := Request{Cmd: "attach", Rows: rows, Cols: cols}
+	if isNumeric(target) {
+		req.ID, _ = strconv.Atoi(target)
+	} else {
+		req.Name = target
+	}
+	if err := sendJSON(conn, req); err != nil {
+		conn.Close()
+		die("send failed: %v", err)
+	}
+	var resp Response
+	if err := recvJSON(conn, &resp); err != nil {
+		conn.Close()
+		die("daemon request failed")
+	}
+	if resp.Status < 0 {
+		conn.Close()
+		die("%s", resp.Msg)
+	}
+
+	// Enter raw mode
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		conn.Close()
+		die("failed to set raw mode: %v", err)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// Handle signals for clean restore
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT, syscall.SIGQUIT)
+	go func() {
+		<-sigCh
+		term.Restore(int(os.Stdin.Fd()), oldState)
+		conn.Close()
+		os.Exit(0)
+	}()
+
+	// Handle SIGWINCH
+	winchCh := make(chan os.Signal, 1)
+	signal.Notify(winchCh, syscall.SIGWINCH)
+	go func() {
+		for range winchCh {
+			r, c := getWinsize()
+			var buf [4]byte
+			binary.BigEndian.PutUint16(buf[0:2], r)
+			binary.BigEndian.PutUint16(buf[2:4], c)
+			sendFrame(conn, frameResize, buf[:])
+		}
+	}()
+
+	// Send initial resize
+	{
+		var buf [4]byte
+		binary.BigEndian.PutUint16(buf[0:2], rows)
+		binary.BigEndian.PutUint16(buf[2:4], cols)
+		sendFrame(conn, frameResize, buf[:])
+	}
+
+	done := make(chan struct{})
+
+	// Read from daemon -> stdout
+	go func() {
+		defer close(done)
+		for {
+			typ, data, err := recvFrame(conn)
+			if err != nil || typ == frameExit {
+				return
+			}
+			if typ == frameData {
+				os.Stdout.Write(data)
+			}
+		}
+	}()
+
+	// Read stdin -> daemon (filter Ctrl+\)
+	go func() {
+		buf := make([]byte, maxPayload)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				conn.Close()
+				return
+			}
+			// Scan for detach key (Ctrl+\, 0x1c)
+			for i := 0; i < n; i++ {
+				if buf[i] == 0x1c {
+					if i > 0 {
+						sendFrame(conn, frameData, buf[:i])
+					}
+					conn.Close()
+					return
+				}
+			}
+			sendFrame(conn, frameData, buf[:n])
+		}
+	}()
+
+	<-done
+}
+
+func cmdExec(target string, timeoutSec int, command string) {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+
+	req := Request{Cmd: "exec", Command: command}
+	if isNumeric(target) {
+		req.ID, _ = strconv.Atoi(target)
+	} else {
+		req.Name = target
+	}
+	if err := sendJSON(conn, req); err != nil {
+		conn.Close()
+		die("send failed: %v", err)
+	}
+	var resp Response
+	if err := recvJSON(conn, &resp); err != nil {
+		conn.Close()
+		die("daemon request failed")
+	}
+	if resp.Status < 0 {
+		conn.Close()
+		die("%s", resp.Msg)
+	}
+
+	marker := []byte(resp.Marker)
+	deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+	var scanBuf []byte
+
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			fmt.Fprintf(os.Stderr, "\nsimpterm: exec timed out\n")
+			conn.Close()
+			os.Exit(1)
+		}
+		conn.SetReadDeadline(time.Now().Add(remaining))
+
+		typ, data, err := recvFrame(conn)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				fmt.Fprintf(os.Stderr, "\nsimpterm: exec timed out\n")
+				conn.Close()
+				os.Exit(1)
+			}
+			break
+		}
+		if typ == frameExit {
+			break
+		}
+		if typ != frameData {
+			continue
+		}
+
+		scanBuf = append(scanBuf, data...)
+
+		if idx := bytes.Index(scanBuf, marker); idx >= 0 {
+			// Find start of marker line
+			lineStart := idx
+			for lineStart > 0 && scanBuf[lineStart-1] != '\n' {
+				lineStart--
+			}
+			if lineStart > 0 {
+				os.Stdout.Write(scanBuf[:lineStart])
+			}
+			conn.Close()
+			return
+		}
+
+		// Flush data that can't contain the marker
+		keep := len(marker) - 1
+		if keep < 0 {
+			keep = 0
+		}
+		if len(scanBuf) > keep {
+			flush := len(scanBuf) - keep
+			os.Stdout.Write(scanBuf[:flush])
+			scanBuf = scanBuf[flush:]
+		}
+	}
+
+	// Flush remaining
+	if len(scanBuf) > 0 {
+		os.Stdout.Write(scanBuf)
+	}
+	conn.Close()
+}
+
+// --- Helpers ---
+
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func die(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(1)
+}
+
+// --- Main ---
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `usage:
+  simpterm n [name]                  new session
+  simpterm a <name|id>               attach
+  simpterm e <name|id> <timeout> <cmd> exec command
+  simpterm l                         list sessions
+  simpterm k <name|id>               kill session
+`)
+}
+
+func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "__daemon" {
+		daemonMain()
+		return
+	}
+
+	_ = strings.Join // suppress import warning
+	if len(os.Args) < 2 || len(os.Args[1]) != 1 {
+		usage()
+		os.Exit(1)
+	}
+
+	switch os.Args[1][0] {
+	case 'n':
+		var name string
+		if len(os.Args) >= 3 {
+			name = os.Args[2]
+		}
+		if name != "" && isNumeric(name) {
+			die("session name cannot be purely numeric")
+		}
+		cmdNew(name)
+	case 'a':
+		if len(os.Args) != 3 {
+			usage()
+			os.Exit(1)
+		}
+		cmdAttach(os.Args[2])
+	case 'e':
+		if len(os.Args) < 5 {
+			usage()
+			os.Exit(1)
+		}
+		if !isNumeric(os.Args[3]) {
+			die("timeout must be a number (seconds)")
+		}
+		timeout, _ := strconv.Atoi(os.Args[3])
+		cmdExec(os.Args[2], timeout, os.Args[4])
+	case 'l':
+		cmdList()
+	case 'k':
+		if len(os.Args) != 3 {
+			usage()
+			os.Exit(1)
+		}
+		cmdKill(os.Args[2])
+	default:
+		usage()
+		os.Exit(1)
+	}
+}

@@ -1,11 +1,7 @@
-CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -pedantic
-LDFLAGS ?=
-
 all: simpterm
 
-simpterm: simpterm.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+simpterm: main.go go.mod go.sum
+	go build -o $@ .
 
 clean:
 	rm -f simpterm

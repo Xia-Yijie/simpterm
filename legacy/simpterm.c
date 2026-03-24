@@ -242,9 +242,17 @@ static void ensure_daemon_running(void) {
 }
 
 static ssize_t send_msg(int fd, const void *buf, size_t len) {
+    int retries = 0;
     for (;;) {
         ssize_t n = send(fd, buf, len, 0);
         if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            if (++retries > 100) {
+                return -1;
+            }
+            usleep(1000);
             continue;
         }
         return n;
