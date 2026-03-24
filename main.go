@@ -386,6 +386,20 @@ func (d *Daemon) handleKill(conn net.Conn, req Request) {
 	sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name})
 }
 
+func (d *Daemon) handleDetach(conn net.Conn, req Request) {
+	s := d.findSession(req.Name, req.ID)
+	if s == nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session not found"})
+		return
+	}
+	if s.getClient() == nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session not attached"})
+		return
+	}
+	s.detachClient()
+	sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name})
+}
+
 func (d *Daemon) handleAttach(conn net.Conn, req Request) {
 	s := d.findSession(req.Name, req.ID)
 	if s == nil {
@@ -517,6 +531,9 @@ func (d *Daemon) handleConn(conn net.Conn) {
 		conn.Close()
 	case "kill":
 		d.handleKill(conn, req)
+		conn.Close()
+	case "detach":
+		d.handleDetach(conn, req)
 		conn.Close()
 	case "attach":
 		d.handleAttach(conn, req)
@@ -683,6 +700,14 @@ func cmdList() {
 }
 
 func cmdKill(target string) {
+	simpleCmd("kill", target)
+}
+
+func cmdDetach(target string) {
+	simpleCmd("detach", target)
+}
+
+func simpleCmd(cmd, target string) {
 	ensureDaemon()
 	conn, err := connectDaemon()
 	if err != nil {
@@ -690,7 +715,7 @@ func cmdKill(target string) {
 	}
 	defer conn.Close()
 
-	req := Request{Cmd: "kill"}
+	req := Request{Cmd: cmd}
 	if isNumeric(target) {
 		req.ID, _ = strconv.Atoi(target)
 	} else {
@@ -931,11 +956,12 @@ func die(format string, args ...any) {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  simpterm n [name]                  new session
-  simpterm a <name|id>               attach
+  simpterm n [name]                    new session
+  simpterm a <name|id>                 attach
+  simpterm d <name|id>                 detach
   simpterm e <name|id> <timeout> <cmd> exec command
-  simpterm l                         list sessions
-  simpterm k <name|id>               kill session
+  simpterm l                           list sessions
+  simpterm k <name|id>                 kill session
 `)
 }
 
@@ -967,6 +993,12 @@ func main() {
 			os.Exit(1)
 		}
 		cmdAttach(os.Args[2])
+	case 'd':
+		if len(os.Args) != 3 {
+			usage()
+			os.Exit(1)
+		}
+		cmdDetach(os.Args[2])
 	case 'e':
 		if len(os.Args) < 5 {
 			usage()
