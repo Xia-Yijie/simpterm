@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -973,13 +972,22 @@ func die(format string, args ...any) {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  simpterm n [name]                    new session
-  simpterm a <name|id>                 attach
-  simpterm d <name|id>                 detach
-  simpterm e <name|id> <timeout> <cmd> exec command
-  simpterm l                           list sessions
-  simpterm k <name|id>                 kill session
+  simpterm [n]ew [name]                    create session
+  simpterm [a]ttach <name|id>              attach to session
+  simpterm [d]etach <name|id>              detach session
+  simpterm [e]xec <name|id> <timeout> <cmd> exec command
+  simpterm [l]ist                          list sessions
+  simpterm [k]ill <name|id>               kill session
 `)
+}
+
+var cmdAliases = map[string]string{
+	"n": "n", "new": "n",
+	"a": "a", "attach": "a",
+	"d": "d", "detach": "d",
+	"e": "e", "exec": "e",
+	"l": "l", "list": "l",
+	"k": "k", "kill": "k",
 }
 
 func main() {
@@ -988,14 +996,19 @@ func main() {
 		return
 	}
 
-	_ = strings.Join // suppress import warning
-	if len(os.Args) < 2 || len(os.Args[1]) != 1 {
+	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
 
-	switch os.Args[1][0] {
-	case 'n':
+	cmd, ok := cmdAliases[os.Args[1]]
+	if !ok {
+		usage()
+		os.Exit(1)
+	}
+
+	switch cmd {
+	case "n":
 		var name string
 		if len(os.Args) >= 3 {
 			name = os.Args[2]
@@ -1004,19 +1017,19 @@ func main() {
 			die("session name cannot be purely numeric")
 		}
 		cmdNew(name)
-	case 'a':
+	case "a":
 		if len(os.Args) != 3 {
 			usage()
 			os.Exit(1)
 		}
 		cmdAttach(os.Args[2])
-	case 'd':
+	case "d":
 		if len(os.Args) != 3 {
 			usage()
 			os.Exit(1)
 		}
 		cmdDetach(os.Args[2])
-	case 'e':
+	case "e":
 		if len(os.Args) < 5 {
 			usage()
 			os.Exit(1)
@@ -1026,16 +1039,13 @@ func main() {
 		}
 		timeout, _ := strconv.Atoi(os.Args[3])
 		cmdExec(os.Args[2], timeout, os.Args[4])
-	case 'l':
+	case "l":
 		cmdList()
-	case 'k':
+	case "k":
 		if len(os.Args) != 3 {
 			usage()
 			os.Exit(1)
 		}
 		cmdKill(os.Args[2])
-	default:
-		usage()
-		os.Exit(1)
 	}
 }
