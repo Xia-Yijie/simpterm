@@ -972,12 +972,18 @@ func die(format string, args ...any) {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage:
-  simpterm [n]ew [name]                    create session
-  simpterm [a]ttach <name|id>              attach to session
-  simpterm [d]etach <name|id>              detach session
-  simpterm [e]xec <name|id> <timeout> <cmd> exec command
-  simpterm [l]ist                          list sessions
-  simpterm [k]ill <name|id>               kill session
+  simpterm [n]ew [name]
+      Create a new session
+  simpterm [a]ttach <name|id>
+      Attach to a session (Ctrl+\ to detach)
+  simpterm [d]etach <name|id>
+      Detach a session remotely
+  simpterm [e]xec <name|id> <timeout> <cmd>
+      Execute a command and stream output
+  simpterm [l]ist
+      List all sessions
+  simpterm [k]ill <name|id>
+      Kill a session
 `)
 }
 
