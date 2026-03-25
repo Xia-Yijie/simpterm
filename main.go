@@ -298,8 +298,17 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 	if shell == "" {
 		shell = "/bin/sh"
 	}
+
+	// Determine session name early for env setup
+	sessionName := name
+	if sessionName == "" {
+		sessionName = fmt.Sprintf("s%d", d.nextID)
+	}
+
 	cmd := exec.Command(shell)
-	cmd.Env = os.Environ()
+	env := os.Environ()
+	env = append(env, "SIMPTERM_SESSION="+sessionName)
+	cmd.Env = env
 
 	rows, cols := uint16(24), uint16(80)
 	if req.Rows > 0 {
@@ -334,6 +343,14 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 	d.mu.Unlock()
 
 	go s.ptyReader()
+
+	// Inject PS1 prefix after shell starts to show session name in prompt
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		inject := fmt.Sprintf(` PS1="\[\033[01;33m\][%s]\[\033[00m\] $PS1"; clear`+"\n", sessionName)
+		s.PtyFile.Write([]byte(inject))
+	}()
+
 	go func() {
 		s.Cmd.Wait()
 		s.PtyFile.Close()
