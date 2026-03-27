@@ -984,6 +984,8 @@ func usage() {
       List all sessions
   simpterm [k]ill <name|id>
       Kill a session
+  simpterm [r]ead <workspace>
+      Browse and read files in a directory
 `)
 }
 
@@ -994,6 +996,7 @@ var cmdAliases = map[string]string{
 	"e": "e", "exec": "e",
 	"l": "l", "list": "l",
 	"k": "k", "kill": "k",
+	"r": "r", "read": "r",
 }
 
 func main() {
@@ -1053,5 +1056,11 @@ func main() {
 			os.Exit(1)
 		}
 		cmdKill(os.Args[2])
+	case "r":
+		if len(os.Args) != 3 {
+			usage()
+			os.Exit(1)
+		}
+		cmdRead(os.Args[2])
 	}
 }

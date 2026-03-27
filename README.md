@@ -4,11 +4,17 @@
 
 ## 安装
 
+一键安装（自动检测系统和架构）：
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Xia-Yijie/simpterm/main/install.sh | bash
+```
+
+或从源码编译：
+
 ```bash
 pixi run compile
 ```
-
-编译后将 `simpterm` 加入 PATH 即可。
 
 ## 使用
 
