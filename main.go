@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -35,6 +36,8 @@ const (
 	maxPayload   = 4096
 	idleTimeout  = 10 * time.Second
 )
+
+var version = "2026-03-29"
 
 type Request struct {
 	Cmd     string `json:"cmd"`
@@ -79,6 +82,32 @@ func sendJSON(conn net.Conn, v any) error {
 	}
 	_, err = conn.Write(data)
 	return err
+}
+
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func promptInjectCommand(shell, sessionName string) string {
+	name := shellSingleQuote("[" + sessionName + "]")
+
+	switch filepath.Base(shell) {
+	case "zsh":
+		return fmt.Sprintf(
+			" PROMPT=$'%%{\\e[01;33m%%}'%s$'%%{\\e[00m%%} '\"$PROMPT\"; clear\n",
+			name,
+		)
+	case "bash":
+		return fmt.Sprintf(
+			" PS1=$'\\\\[\\e[01;33m\\\\]'%s$'\\\\[\\e[00m\\\\] '\"$PS1\"; clear\n",
+			name,
+		)
+	default:
+		return fmt.Sprintf(
+			" PS1=$'\\e[01;33m'%s$'\\e[00m '\"$PS1\"; clear\n",
+			name,
+		)
+	}
 }
 
 func recvJSON(conn net.Conn, v any) error {
@@ -346,7 +375,7 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 	// Inject PS1 prefix after shell starts to show session name in prompt
 	go func() {
 		time.Sleep(200 * time.Millisecond)
-		inject := fmt.Sprintf(` PS1="\[\033[01;33m\][%s]\[\033[00m\] $PS1"; clear`+"\n", sessionName)
+		inject := promptInjectCommand(shell, sessionName)
 		s.PtyFile.Write([]byte(inject))
 	}()
 
@@ -971,7 +1000,9 @@ func die(format string, args ...any) {
 // --- Main ---
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `usage:
+	fmt.Fprintf(os.Stderr, `simpterm %s
+
+usage:
   simpterm [n]ew [name]
       Create a new session
   simpterm [a]ttach <name|id>
@@ -986,7 +1017,7 @@ func usage() {
       Kill a session
   simpterm [r]ead <workspace>
       Browse and read files in a directory
-`)
+`, version)
 }
 
 var cmdAliases = map[string]string{
