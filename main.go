@@ -20,6 +20,7 @@ import (
 	"unicode"
 
 	ptylib "github.com/creack/pty"
+	"github.com/hinshun/vt10x"
 	"golang.org/x/term"
 )
 
@@ -67,6 +68,12 @@ type SessionInfo struct {
 type ListResponse struct {
 	Status   int           `json:"status"`
 	Sessions []SessionInfo `json:"sessions"`
+}
+
+type ReadResponse struct {
+	Status int    `json:"status"`
+	Msg    string `json:"msg,omitempty"`
+	Screen string `json:"screen,omitempty"`
 }
 
 // Wire helpers: 4-byte big-endian length + JSON payload
@@ -178,6 +185,7 @@ type Session struct {
 	backlogMu sync.Mutex
 	backlog   []byte
 
+	vt   vt10x.Terminal
 	done chan struct{}
 }
 
@@ -241,6 +249,7 @@ func (s *Session) ptyReader() {
 		if n > 0 {
 			data := buf[:n]
 			s.appendBacklog(data)
+			s.vt.Write(data)
 			if c := s.getClient(); c != nil {
 				if sendFrame(c, frameData, data) != nil {
 					s.detachClient()
@@ -369,6 +378,7 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 		Name:    name,
 		PtyFile: ptmx,
 		Cmd:     cmd,
+		vt:      vt10x.New(vt10x.WithSize(int(cols), int(rows))),
 		done:    make(chan struct{}),
 	}
 	d.sessions[id] = s
@@ -460,9 +470,10 @@ func (d *Daemon) handleAttach(conn net.Conn, req Request) {
 		return
 	}
 
-	// Resize PTY
+	// Resize PTY and virtual terminal
 	if req.Rows > 0 && req.Cols > 0 {
 		ptylib.Setsize(s.PtyFile, &ptylib.Winsize{Rows: req.Rows, Cols: req.Cols})
+		s.vt.Resize(int(req.Cols), int(req.Rows))
 	}
 
 	pid := 0
@@ -509,6 +520,7 @@ func (d *Daemon) handleAttach(conn net.Conn, req Request) {
 					rows := binary.BigEndian.Uint16(data[0:2])
 					cols := binary.BigEndian.Uint16(data[2:4])
 					ptylib.Setsize(s.PtyFile, &ptylib.Winsize{Rows: rows, Cols: cols})
+					s.vt.Resize(int(cols), int(rows))
 				}
 			}
 		}
@@ -564,6 +576,35 @@ func (d *Daemon) handleExec(conn net.Conn, req Request) {
 	}()
 }
 
+func (d *Daemon) handleSend(conn net.Conn, req Request) {
+	s := d.findSession(req.Name, req.ID)
+	if s == nil {
+		sendJSON(conn, Response{Status: -1, Msg: "session not found"})
+		return
+	}
+	if req.Command == "" {
+		sendJSON(conn, Response{Status: -1, Msg: "empty input"})
+		return
+	}
+	if _, err := s.PtyFile.Write([]byte(req.Command)); err != nil {
+		sendJSON(conn, Response{Status: -1, Msg: fmt.Sprintf("write failed: %v", err)})
+		return
+	}
+	sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name})
+}
+
+func (d *Daemon) handleRead(conn net.Conn, req Request) {
+	s := d.findSession(req.Name, req.ID)
+	if s == nil {
+		sendJSON(conn, ReadResponse{Status: -1, Msg: "session not found"})
+		return
+	}
+	s.vt.Lock()
+	screen := s.vt.String()
+	s.vt.Unlock()
+	sendJSON(conn, ReadResponse{Status: 0, Screen: screen})
+}
+
 func (d *Daemon) handleConn(conn net.Conn) {
 	var req Request
 	if err := recvJSON(conn, &req); err != nil {
@@ -590,6 +631,12 @@ func (d *Daemon) handleConn(conn net.Conn) {
 	case "exec":
 		d.handleExec(conn, req)
 		// conn stays open, managed by session
+	case "send":
+		d.handleSend(conn, req)
+		conn.Close()
+	case "read":
+		d.handleRead(conn, req)
+		conn.Close()
 	default:
 		conn.Close()
 	}
@@ -982,6 +1029,59 @@ func cmdExec(target string, timeoutSec int, command string) {
 	conn.Close()
 }
 
+func cmdSend(target string, input string) {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := Request{Cmd: "send", Command: input}
+	if isNumeric(target) {
+		req.ID, _ = strconv.Atoi(target)
+	} else {
+		req.Name = target
+	}
+	if err := sendJSON(conn, req); err != nil {
+		die("send failed: %v", err)
+	}
+	var resp Response
+	if err := recvJSON(conn, &resp); err != nil {
+		die("daemon request failed")
+	}
+	if resp.Status < 0 {
+		die("%s", resp.Msg)
+	}
+}
+
+func cmdRead(target string) {
+	ensureDaemon()
+	conn, err := connectDaemon()
+	if err != nil {
+		die("connect daemon failed: %v", err)
+	}
+	defer conn.Close()
+
+	req := Request{Cmd: "read"}
+	if isNumeric(target) {
+		req.ID, _ = strconv.Atoi(target)
+	} else {
+		req.Name = target
+	}
+	if err := sendJSON(conn, req); err != nil {
+		die("send failed: %v", err)
+	}
+	var resp ReadResponse
+	if err := recvJSON(conn, &resp); err != nil {
+		die("daemon request failed")
+	}
+	if resp.Status < 0 {
+		die("%s", resp.Msg)
+	}
+	fmt.Print(resp.Screen)
+}
+
 // --- Helpers ---
 
 func isNumeric(s string) bool {
@@ -1015,6 +1115,10 @@ usage:
       Detach a session remotely
   simpterm [e]xec <name|id> <timeout> [--cwd <dir>] <cmd>
       Execute a command and stream output
+  simpterm [s]end <name|id> <input>
+      Send input to a session (no wait)
+  simpterm [r]ead <name|id>
+      Read current screen content
   simpterm [l]ist
       List all sessions
   simpterm [k]ill <name|id>
@@ -1027,6 +1131,8 @@ var cmdAliases = map[string]string{
 	"a": "a", "attach": "a",
 	"d": "d", "detach": "d",
 	"e": "e", "exec": "e",
+	"s": "s", "send": "s",
+	"r": "r", "read": "r",
 	"l": "l", "list": "l",
 	"k": "k", "kill": "k",
 }
@@ -1109,6 +1215,18 @@ func main() {
 			cmd = fmt.Sprintf("cd %s && %s", shellSingleQuote(cwd), cmd)
 		}
 		cmdExec(os.Args[2], timeout, cmd)
+	case "s":
+		if len(os.Args) != 4 {
+			usage()
+			os.Exit(1)
+		}
+		cmdSend(os.Args[2], os.Args[3])
+	case "r":
+		if len(os.Args) != 3 {
+			usage()
+			os.Exit(1)
+		}
+		cmdRead(os.Args[2])
 	case "l":
 		cmdList()
 	case "k":
