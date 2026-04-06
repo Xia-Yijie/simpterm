@@ -599,9 +599,7 @@ func (d *Daemon) handleRead(conn net.Conn, req Request) {
 		sendJSON(conn, ReadResponse{Status: -1, Msg: "session not found"})
 		return
 	}
-	s.vt.Lock()
 	screen := s.vt.String()
-	s.vt.Unlock()
 	sendJSON(conn, ReadResponse{Status: 0, Screen: screen})
 }
 
