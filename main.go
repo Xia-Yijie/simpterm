@@ -46,6 +46,7 @@ type Request struct {
 	Rows    uint16 `json:"rows,omitempty"`
 	Cols    uint16 `json:"cols,omitempty"`
 	Command string `json:"command,omitempty"`
+	Cwd     string `json:"cwd,omitempty"`
 }
 
 type Response struct {
@@ -334,6 +335,9 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 	}
 
 	cmd := exec.Command(shell)
+	if req.Cwd != "" {
+		cmd.Dir = req.Cwd
+	}
 	env := os.Environ()
 	env = append(env, "SIMPTERM_SESSION="+sessionName)
 	cmd.Env = env
@@ -700,7 +704,7 @@ func getWinsize() (uint16, uint16) {
 	return uint16(h), uint16(w)
 }
 
-func cmdNew(name string) {
+func cmdNew(name string, cwd string) {
 	ensureDaemon()
 	conn, err := connectDaemon()
 	if err != nil {
@@ -709,7 +713,7 @@ func cmdNew(name string) {
 	defer conn.Close()
 
 	rows, cols := getWinsize()
-	req := Request{Cmd: "new", Name: name, Rows: rows, Cols: cols}
+	req := Request{Cmd: "new", Name: name, Rows: rows, Cols: cols, Cwd: cwd}
 	if err := sendJSON(conn, req); err != nil {
 		die("send failed: %v", err)
 	}
@@ -924,7 +928,7 @@ func cmdExec(target string, timeoutSec int, command string) {
 		if remaining <= 0 {
 			fmt.Fprintf(os.Stderr, "\nsimpterm: exec timed out\n")
 			conn.Close()
-			os.Exit(1)
+			os.Exit(124)
 		}
 		conn.SetReadDeadline(time.Now().Add(remaining))
 
@@ -933,7 +937,7 @@ func cmdExec(target string, timeoutSec int, command string) {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				fmt.Fprintf(os.Stderr, "\nsimpterm: exec timed out\n")
 				conn.Close()
-				os.Exit(1)
+				os.Exit(124)
 			}
 			break
 		}
@@ -1003,13 +1007,13 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `simpterm %s
 
 usage:
-  simpterm [n]ew [name]
+  simpterm [n]ew [name] [--cwd <dir>]
       Create a new session
   simpterm [a]ttach <name|id>
       Attach to a session (Ctrl+\ to detach)
   simpterm [d]etach <name|id>
       Detach a session remotely
-  simpterm [e]xec <name|id> <timeout> <cmd>
+  simpterm [e]xec <name|id> <timeout> [--cwd <dir>] <cmd>
       Execute a command and stream output
   simpterm [l]ist
       List all sessions
@@ -1046,14 +1050,29 @@ func main() {
 
 	switch cmd {
 	case "n":
-		var name string
-		if len(os.Args) >= 3 {
-			name = os.Args[2]
+		args := os.Args[2:]
+		var name, cwd string
+		for len(args) > 0 {
+			if args[0] == "--cwd" {
+				if len(args) < 2 {
+					usage()
+					os.Exit(1)
+				}
+				cwd = args[1]
+				args = args[2:]
+			} else {
+				if name != "" {
+					usage()
+					os.Exit(1)
+				}
+				name = args[0]
+				args = args[1:]
+			}
 		}
 		if name != "" && isNumeric(name) {
 			die("session name cannot be purely numeric")
 		}
-		cmdNew(name)
+		cmdNew(name, cwd)
 	case "a":
 		if len(os.Args) != 3 {
 			usage()
@@ -1075,7 +1094,21 @@ func main() {
 			die("timeout must be a number (seconds)")
 		}
 		timeout, _ := strconv.Atoi(os.Args[3])
-		cmdExec(os.Args[2], timeout, os.Args[4])
+		args := os.Args[4:]
+		var cwd string
+		if len(args) >= 2 && args[0] == "--cwd" {
+			cwd = args[1]
+			args = args[2:]
+		}
+		if len(args) != 1 {
+			usage()
+			os.Exit(1)
+		}
+		cmd := args[0]
+		if cwd != "" {
+			cmd = fmt.Sprintf("cd %s && %s", shellSingleQuote(cwd), cmd)
+		}
+		cmdExec(os.Args[2], timeout, cmd)
 	case "l":
 		cmdList()
 	case "k":
