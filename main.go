@@ -396,8 +396,14 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 	go func() {
 		s.Cmd.Wait()
 		s.PtyFile.Close()
-		// Wait for ptyReader to finish
-		<-s.done
+		// Wait for ptyReader to finish, but don't block forever: orphaned
+		// grandchildren may keep the PTY slave open, preventing the master
+		// Read from returning even after we close our end. Without a timeout
+		// the session would stay listed indefinitely after its process is gone.
+		select {
+		case <-s.done:
+		case <-time.After(2 * time.Second):
+		}
 		s.detachClient()
 		s.detachExec()
 		d.removeSession(s.ID)
