@@ -38,7 +38,7 @@ const (
 	idleTimeout  = 10 * time.Second
 )
 
-var version = "2026-03-29"
+var version = "2026-04-13"
 
 type Request struct {
 	Cmd     string `json:"cmd"`
@@ -63,11 +63,13 @@ type SessionInfo struct {
 	ID   int    `json:"id"`
 	Name string `json:"name"`
 	PID  int    `json:"pid"`
+	Exit string `json:"exit,omitempty"`
 }
 
 type ListResponse struct {
 	Status   int           `json:"status"`
 	Sessions []SessionInfo `json:"sessions"`
+	Reaped   []SessionInfo `json:"reaped,omitempty"`
 }
 
 type ReadResponse struct {
@@ -315,6 +317,34 @@ func (d *Daemon) removeSession(id int) {
 	delete(d.sessions, id)
 }
 
+// reapDead removes any session whose process has already exited but whose
+// normal cleanup goroutine did not remove the entry (e.g. because the PTY
+// Read stayed blocked). Returns info, including exit status, for each one.
+func (d *Daemon) reapDead() []SessionInfo {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var reaped []SessionInfo
+	for id, s := range d.sessions {
+		if s.Cmd.ProcessState == nil {
+			continue
+		}
+		pid := 0
+		if s.Cmd.Process != nil {
+			pid = s.Cmd.Process.Pid
+		}
+		reaped = append(reaped, SessionInfo{
+			ID:   s.ID,
+			Name: s.Name,
+			PID:  pid,
+			Exit: s.Cmd.ProcessState.String(),
+		})
+		s.detachClient()
+		s.detachExec()
+		delete(d.sessions, id)
+	}
+	return reaped
+}
+
 func (d *Daemon) sessionCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -417,6 +447,7 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 }
 
 func (d *Daemon) handleList(conn net.Conn) {
+	reaped := d.reapDead()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var infos []SessionInfo
@@ -427,7 +458,7 @@ func (d *Daemon) handleList(conn net.Conn) {
 		}
 		infos = append(infos, SessionInfo{ID: s.ID, Name: s.Name, PID: pid})
 	}
-	sendJSON(conn, ListResponse{Status: 0, Sessions: infos})
+	sendJSON(conn, ListResponse{Status: 0, Sessions: infos, Reaped: reaped})
 }
 
 func (d *Daemon) handleKill(conn net.Conn, req Request) {
@@ -469,6 +500,14 @@ func (d *Daemon) handleAttach(conn net.Conn, req Request) {
 	s := d.findSession(req.Name, req.ID)
 	if s == nil {
 		sendJSON(conn, Response{Status: -1, Msg: "session not found"})
+		return
+	}
+	if s.Cmd.ProcessState != nil {
+		exit := s.Cmd.ProcessState.String()
+		s.detachClient()
+		s.detachExec()
+		d.removeSession(s.ID)
+		sendJSON(conn, Response{Status: -1, Msg: fmt.Sprintf("session %d (%s) died: %s, removed", s.ID, s.Name, exit)})
 		return
 	}
 	if s.getClient() != nil {
@@ -792,6 +831,9 @@ func cmdList() {
 	var resp ListResponse
 	if err := recvJSON(conn, &resp); err != nil {
 		die("daemon request failed")
+	}
+	for _, s := range resp.Reaped {
+		fmt.Fprintf(os.Stderr, "session %d (%s) died: %s, removed\n", s.ID, s.Name, s.Exit)
 	}
 	fmt.Println("ID\tNAME\tPID")
 	for _, s := range resp.Sessions {
