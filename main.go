@@ -461,6 +461,51 @@ func (d *Daemon) handleList(conn net.Conn) {
 	sendJSON(conn, ListResponse{Status: 0, Sessions: infos, Reaped: reaped})
 }
 
+// sessionMembers returns the pids of all processes whose session id equals
+// sid (as reported by /proc/PID/stat field 6). The shell we spawned with
+// Setsid is a session leader, so every descendant — including backgrounded
+// jobs that bash's job control moved to a new pgid — still shares this sid.
+// Returns nil if /proc is unavailable (non-Linux).
+func sessionMembers(sid int) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var pids []int
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// comm (field 2) is parenthesized and may contain spaces/parens;
+		// skip past the final ')' to find the remaining space-separated fields.
+		idx := bytes.LastIndexByte(data, ')')
+		if idx < 0 || idx+2 >= len(data) {
+			continue
+		}
+		fields := strings.Fields(string(data[idx+2:]))
+		// After comm: state, ppid, pgrp, session, ...
+		if len(fields) < 4 {
+			continue
+		}
+		s, err := strconv.Atoi(fields[3])
+		if err != nil {
+			continue
+		}
+		if s == sid {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
+
 func (d *Daemon) handleKill(conn net.Conn, req Request) {
 	s := d.findSession(req.Name, req.ID)
 	if s == nil {
@@ -468,15 +513,27 @@ func (d *Daemon) handleKill(conn net.Conn, req Request) {
 		return
 	}
 	if s.Cmd.Process != nil {
-		// Kill process group
-		syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGHUP)
-		syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGTERM)
-		// Wait briefly, then SIGKILL if needed
+		// The shell was started with Setsid, so its pid is the session id
+		// and every descendant (including bash-job-control'd grandchildren
+		// in their own pgids) still reports this as their session.
+		sid := s.Cmd.Process.Pid
+		members := sessionMembers(sid)
+		if len(members) == 0 {
+			// /proc unavailable; fall back to the shell's process group.
+			members = []int{-sid}
+		}
+		for _, p := range members {
+			syscall.Kill(p, syscall.SIGHUP)
+			syscall.Kill(p, syscall.SIGTERM)
+		}
+		// Wait briefly for voluntary exit, then SIGKILL any survivors.
 		timer := time.After(500 * time.Millisecond)
 		select {
 		case <-s.done:
 		case <-timer:
-			syscall.Kill(-s.Cmd.Process.Pid, syscall.SIGKILL)
+		}
+		for _, p := range sessionMembers(sid) {
+			syscall.Kill(p, syscall.SIGKILL)
 		}
 	}
 	sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name})
