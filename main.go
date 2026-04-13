@@ -191,6 +191,13 @@ type Session struct {
 	done chan struct{}
 }
 
+func (s *Session) pid() int {
+	if s.Cmd.Process != nil {
+		return s.Cmd.Process.Pid
+	}
+	return 0
+}
+
 func (s *Session) appendBacklog(data []byte) {
 	s.backlogMu.Lock()
 	defer s.backlogMu.Unlock()
@@ -317,32 +324,27 @@ func (d *Daemon) removeSession(id int) {
 	delete(d.sessions, id)
 }
 
-// reapDead removes any session whose process has already exited but whose
-// normal cleanup goroutine did not remove the entry (e.g. because the PTY
-// Read stayed blocked). Returns info, including exit status, for each one.
-func (d *Daemon) reapDead() []SessionInfo {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	var reaped []SessionInfo
-	for id, s := range d.sessions {
-		if s.Cmd.ProcessState == nil {
-			continue
-		}
-		pid := 0
-		if s.Cmd.Process != nil {
-			pid = s.Cmd.Process.Pid
-		}
-		reaped = append(reaped, SessionInfo{
-			ID:   s.ID,
-			Name: s.Name,
-			PID:  pid,
-			Exit: s.Cmd.ProcessState.String(),
-		})
-		s.detachClient()
-		s.detachExec()
-		delete(d.sessions, id)
+// teardown closes any client/exec connections and removes the session from
+// the daemon's map. Safe to call multiple times; each step is idempotent.
+func (d *Daemon) teardown(s *Session) {
+	s.detachClient()
+	s.detachExec()
+	d.removeSession(s.ID)
+}
+
+// markDead snapshots SessionInfo (with exit status) for a session whose
+// process has already exited, then tears it down. Used when we detect a
+// session whose cleanup goroutine did not (yet) remove the entry — e.g.
+// because the PTY Read stayed blocked on grandchildren holding the slave.
+func (d *Daemon) markDead(s *Session) SessionInfo {
+	info := SessionInfo{
+		ID:   s.ID,
+		Name: s.Name,
+		PID:  s.pid(),
+		Exit: s.Cmd.ProcessState.String(),
 	}
-	return reaped
+	d.teardown(s)
+	return info
 }
 
 func (d *Daemon) sessionCount() int {
@@ -434,29 +436,27 @@ func (d *Daemon) handleNew(conn net.Conn, req Request) {
 		case <-s.done:
 		case <-time.After(2 * time.Second):
 		}
-		s.detachClient()
-		s.detachExec()
-		d.removeSession(s.ID)
+		d.teardown(s)
 	}()
 
-	pid := 0
-	if cmd.Process != nil {
-		pid = cmd.Process.Pid
-	}
-	sendJSON(conn, Response{Status: 0, ID: id, Name: name, PID: pid})
+	sendJSON(conn, Response{Status: 0, ID: id, Name: name, PID: s.pid()})
 }
 
 func (d *Daemon) handleList(conn net.Conn) {
-	reaped := d.reapDead()
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	var dead []*Session
 	var infos []SessionInfo
 	for _, s := range d.sessions {
-		pid := 0
-		if s.Cmd.Process != nil {
-			pid = s.Cmd.Process.Pid
+		if s.Cmd.ProcessState != nil {
+			dead = append(dead, s)
+			continue
 		}
-		infos = append(infos, SessionInfo{ID: s.ID, Name: s.Name, PID: pid})
+		infos = append(infos, SessionInfo{ID: s.ID, Name: s.Name, PID: s.pid()})
+	}
+	d.mu.Unlock()
+	var reaped []SessionInfo
+	for _, s := range dead {
+		reaped = append(reaped, d.markDead(s))
 	}
 	sendJSON(conn, ListResponse{Status: 0, Sessions: infos, Reaped: reaped})
 }
@@ -526,14 +526,14 @@ func (d *Daemon) handleKill(conn net.Conn, req Request) {
 			syscall.Kill(p, syscall.SIGHUP)
 			syscall.Kill(p, syscall.SIGTERM)
 		}
-		// Wait briefly for voluntary exit, then SIGKILL any survivors.
-		timer := time.After(500 * time.Millisecond)
 		select {
 		case <-s.done:
-		case <-timer:
-		}
-		for _, p := range sessionMembers(sid) {
-			syscall.Kill(p, syscall.SIGKILL)
+			// Clean exit: PTY reached EOF, so every fd holding the slave
+			// was closed — no survivors to SIGKILL.
+		case <-time.After(500 * time.Millisecond):
+			for _, p := range members {
+				syscall.Kill(p, syscall.SIGKILL)
+			}
 		}
 	}
 	sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name})
@@ -560,11 +560,8 @@ func (d *Daemon) handleAttach(conn net.Conn, req Request) {
 		return
 	}
 	if s.Cmd.ProcessState != nil {
-		exit := s.Cmd.ProcessState.String()
-		s.detachClient()
-		s.detachExec()
-		d.removeSession(s.ID)
-		sendJSON(conn, Response{Status: -1, Msg: fmt.Sprintf("session %d (%s) died: %s, removed", s.ID, s.Name, exit)})
+		info := d.markDead(s)
+		sendJSON(conn, Response{Status: -1, Msg: fmt.Sprintf("session %d (%s) died: %s, removed", info.ID, info.Name, info.Exit)})
 		return
 	}
 	if s.getClient() != nil {
@@ -578,11 +575,7 @@ func (d *Daemon) handleAttach(conn net.Conn, req Request) {
 		s.vt.Resize(int(req.Cols), int(req.Rows))
 	}
 
-	pid := 0
-	if s.Cmd.Process != nil {
-		pid = s.Cmd.Process.Pid
-	}
-	if err := sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name, PID: pid}); err != nil {
+	if err := sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name, PID: s.pid()}); err != nil {
 		return
 	}
 
@@ -653,11 +646,7 @@ func (d *Daemon) handleExec(conn net.Conn, req Request) {
 	marker := generateMarker()
 	wrapped := fmt.Sprintf(" %s\n echo '%s'\n", req.Command, marker)
 
-	pid := 0
-	if s.Cmd.Process != nil {
-		pid = s.Cmd.Process.Pid
-	}
-	if err := sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name, PID: pid, Marker: marker}); err != nil {
+	if err := sendJSON(conn, Response{Status: 0, ID: s.ID, Name: s.Name, PID: s.pid(), Marker: marker}); err != nil {
 		return
 	}
 
